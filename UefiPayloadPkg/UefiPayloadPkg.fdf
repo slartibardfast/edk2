@@ -319,6 +319,7 @@ INF MdeModulePkg/Logo/LogoDxe.inf
 #
 INF MdeModulePkg/Bus/Pci/PciBusDxe/PciBusDxe.inf
 INF MdeModulePkg/Bus/Pci/PciHostBridgeDxe/PciHostBridgeDxe.inf
+INF MdeModulePkg/Bus/Pci/ReBarDxe/ReBarDxe.inf
 
 #
 # ISA Support

@@ -1235,6 +1235,7 @@
     <LibraryClasses>
       PciHostBridgeLib|UefiPayloadPkg/Library/PciHostBridgeLib/PciHostBridgeLib.inf
   }
+  MdeModulePkg/Bus/Pci/ReBarDxe/ReBarDxe.inf
 
   #
   # SCSI/ATA/IDE/DISK Support
