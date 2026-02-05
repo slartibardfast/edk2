@@ -3,10 +3,10 @@
   BASE_NAME                      = ReBarDxe
   FILE_GUID                      = adf0508f-a992-4a0f-8b54-0291517c21aa
   MODULE_TYPE                    = DXE_DRIVER
-  VERSION_STRING                 = 1.0
+  VERSION_STRING                 = 6.0
   ENTRY_POINT                    = rebarInit
- 
-[Sources]  
+
+[Sources]
   ReBar.c
 
 [Packages]
@@ -16,12 +16,18 @@
 [LibraryClasses]
   UefiDriverEntryPoint
   UefiBootServicesTableLib
-  UefiRuntimeServicesTableLib
   UefiLib
-   
+  DebugLib
+  IoLib
+  BaseMemoryLib
+  PrintLib
+
+[Guids]
+  gEfiAcpi20TableGuid
+  gEfiEventReadyToBootGuid
+
 [Protocols]
-  gEfiPciRootBridgeIoProtocolGuid ## SOMETIMES_CONSUMES
-  gEfiPciHostBridgeResourceAllocationProtocolGuid ## SOMETIMES_CONSUMES
+  gEfiGraphicsOutputProtocolGuid  ## SOMETIMES_CONSUMES
 
 [Depex]
-  gEfiPciRootBridgeIoProtocolGuid
+  TRUE
