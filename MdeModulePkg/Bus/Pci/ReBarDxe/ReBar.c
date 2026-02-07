@@ -5,7 +5,7 @@ SPDX-License-Identifier: MIT
 
 Developed with assistance from Claude (Anthropic)
 
-ReBarDXE v7 - ECAM with BAR relocation + in-place growth + eviction
+ReBarDXE v8 - ECAM with BAR relocation + in-place growth + eviction
 
 Strategy:
   At ReadyToBoot we first build a map of every above-4G MMIO region
@@ -19,11 +19,13 @@ Strategy:
       the current base, and verifying natural alignment.  The GOP driver
       holds live pointers into these BARs, so they must not move.
 
-  New in v7: when in-place growth collides with small non-ReBAR BARs
-  on bus 0 (e.g. PCH SMBus/HDA/XHCI), those colliders are evicted to
-  below-4G MMIO space before retrying.  This clears the growth path
-  without touching display-critical BARs, and actually fixes devices
-  like XHCI that shouldn't be above 4G in the first place.
+  New in v8: AMD GPUs zero ALL BAR registers when any ReBAR control
+  register is written.  We now save every BAR register (including
+  non-prefetchable BARs, I/O BARs, and the Expansion ROM BAR) before
+  writing ReBAR control, then restore them immediately after.  BARs
+  that were unassigned (address 0) are allocated fresh addresses in
+  high MMIO space alongside relocated BARs.  Non-prefetchable BARs
+  below 4G (register apertures, I/O ports) are transparently preserved.
 
   Bridge prefetchable windows are updated to cover both relocated and
   in-place-grown BARs.  The GOP FrameBufferBase is patched if BAR0
@@ -71,6 +73,7 @@ Strategy:
 /* ------------------------------------------------------------------ */
 
 #define PCI_CMD_REG                0x04
+#define PCI_CMD_IO_SPACE           0x0001
 #define PCI_CMD_MEMORY_SPACE       0x0002
 
 #define PCI_HEADER_TYPE_OFFSET     0x0E
@@ -90,6 +93,9 @@ Strategy:
 #define PCI_BAR_64BIT              0x04
 #define PCI_BAR_PREFETCHABLE       0x08
 #define PCI_BAR_64BIT_PREF         (PCI_BAR_64BIT | PCI_BAR_PREFETCHABLE)
+
+/* Expansion ROM BAR */
+#define PCI_ROM_BAR_OFFSET         0x30
 
 /* ------------------------------------------------------------------ */
 /*  Vendor / device IDs for quirks and blacklist                       */
@@ -209,7 +215,30 @@ typedef struct {
     UINT64  OldAddr;
     UINT64  NewAddr;
     BOOLEAN Relocated;      /* TRUE = relocated, FALSE = kept in place */
+    BOOLEAN HasRebar;       /* TRUE if BAR has a ReBAR capability entry */
 } PREF_BAR_INFO;
+
+/* ------------------------------------------------------------------ */
+/*  Saved BAR registers for AMD GPU BAR-zeroing workaround             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * AMD GPUs zero ALL BAR registers (including non-prefetchable BARs,
+ * I/O BARs, and the Expansion ROM BAR) when any ReBAR control
+ * register is written.  We must save every BAR register before the
+ * ReBAR CTRL write and restore them immediately after.
+ *
+ * This covers:
+ *   BAR0-BAR5: 6 DWORDs at offsets 0x10-0x24 (for 64-bit BARs,
+ *              two consecutive DWORDs form one BAR)
+ *   ROM BAR:   1 DWORD at offset 0x30
+ */
+#define NUM_BAR_REGS 6
+
+typedef struct {
+    UINT32  Reg[NUM_BAR_REGS];   /* BAR0-BAR5 raw register values */
+    UINT32  RomBar;              /* Expansion ROM BAR raw value */
+} SAVED_BAR_REGS;
 
 /* ================================================================== */
 /*  Utility                                                            */
@@ -402,6 +431,46 @@ static UINT64 ProbeBar64Size(UINT8 bus, UINT8 dev, UINT8 func, UINT8 barIndex)
     if (mask == 0)
         return 0;
     return (~mask) + 1;
+}
+
+/* ================================================================== */
+/*  BAR save / restore (AMD GPU BAR-zeroing workaround)                */
+/* ================================================================== */
+
+/*
+ * AMD GPUs (and possibly other vendors) zero ALL BAR registers when
+ * any ReBAR control register is written.  This includes BARs that
+ * are not being resized: non-prefetchable MMIO BARs, I/O BARs, and
+ * the Expansion ROM BAR.  If not restored, the device loses access
+ * to register apertures, I/O ports, and option ROM — and the bridge
+ * window calculation sees addresses of 0, producing a window that
+ * spans the entire address space and kills other devices' MMIO.
+ *
+ * We save all raw register values before writing any ReBAR CTRL,
+ * then restore them immediately after.  Phase 5 then overwrites
+ * only the BARs that are being relocated with their new addresses.
+ */
+
+static VOID SaveDeviceBars(UINT8 bus, UINT8 dev, UINT8 func,
+                           SAVED_BAR_REGS *saved)
+{
+    for (UINT8 i = 0; i < NUM_BAR_REGS; i++)
+        saved->Reg[i] = EcamRead32(bus, dev, func, 0x10 + i * 4);
+    saved->RomBar = EcamRead32(bus, dev, func, PCI_ROM_BAR_OFFSET);
+
+    DEBUG((DEBUG_INFO, "ReBarDXE:   saved BARs: [%08x %08x %08x %08x %08x %08x] ROM=%08x\n",
+           saved->Reg[0], saved->Reg[1], saved->Reg[2], saved->Reg[3],
+           saved->Reg[4], saved->Reg[5], saved->RomBar));
+}
+
+static VOID RestoreDeviceBars(UINT8 bus, UINT8 dev, UINT8 func,
+                              SAVED_BAR_REGS *saved)
+{
+    for (UINT8 i = 0; i < NUM_BAR_REGS; i++)
+        EcamWrite32(bus, dev, func, 0x10 + i * 4, saved->Reg[i]);
+    EcamWrite32(bus, dev, func, PCI_ROM_BAR_OFFSET, saved->RomBar);
+
+    DEBUG((DEBUG_INFO, "ReBarDXE:   restored BARs from saved state\n"));
 }
 
 /* ================================================================== */
@@ -870,6 +939,11 @@ static VOID SetupDevice(UINT8 bus, UINT8 dev, UINT8 func,
 
     /* -------------------------------------------------------------- */
     /* Phase 1: Collect info on every 64-bit prefetchable BAR          */
+    /*                                                                 */
+    /* v8 fix: for BARs without a ReBAR capability entry, probe the    */
+    /* hardware BAR size so we have accurate NewSizeBytes.  Also       */
+    /* detect BARs with unassigned addresses (OldAddr == 0) that need  */
+    /* fresh allocation.                                               */
     /* -------------------------------------------------------------- */
 
     PREF_BAR_INFO bars[MAX_PREF_BARS];
@@ -880,29 +954,79 @@ static VOID SetupDevice(UINT8 bus, UINT8 dev, UINT8 func,
         if (!IsBar64Pref(bus, dev, func, bar))
             continue;
 
-        UINT8  curSizeIdx   = 0;
-        UINT64 curSizeBytes = 0;
-        INTN   rpos = RebarFindPos(bus, dev, func, epos, bar);
+        UINT8   curSizeIdx   = 0;
+        UINT64  curSizeBytes = 0;
+        BOOLEAN hasRebar     = FALSE;
+        INTN    rpos = RebarFindPos(bus, dev, func, epos, bar);
 
         if (rpos >= 0) {
             curSizeIdx   = RebarGetCurrentSize(bus, dev, func, epos, bar);
             curSizeBytes = 1ULL << (curSizeIdx + 20);
+            hasRebar     = TRUE;
+        } else {
+            /*
+             * v8 fix: No ReBAR entry for this BAR.  Probe the hardware
+             * to get the actual BAR size.  Without this, NewSizeBytes
+             * stays 0 and the bridge window calculation underflows
+             * (0 + 0 - 1 = MAX_UINT64).
+             */
+            UINT16 cmd = EcamRead16(bus, dev, func, PCI_CMD_REG);
+            EcamWrite16(bus, dev, func, PCI_CMD_REG,
+                        cmd & ~(PCI_CMD_MEMORY_SPACE | PCI_CMD_IO_SPACE));
+            curSizeBytes = ProbeBar64Size(bus, dev, func, bar);
+            EcamWrite16(bus, dev, func, PCI_CMD_REG, cmd);
+
+            if (curSizeBytes == 0) {
+                DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d no ReBAR, probe returned 0, skipping\n", bar));
+                bar++;
+                continue;
+            }
+
+            /* Derive a size index for logging (find n such that 2^(n+20) == curSizeBytes) */
+            UINT64 tmp = curSizeBytes >> 20;
+            curSizeIdx = 0;
+            while (tmp > 1) { curSizeIdx++; tmp >>= 1; }
+
+            SizeStr(curSizeIdx, sizeBuf, sizeof(sizeBuf));
+            DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d no ReBAR entry, probed size = %a\n",
+                   bar, sizeBuf));
         }
+
+        UINT64 oldAddr = ReadBar64Addr(bus, dev, func, bar);
 
         bars[barCount].BarIndex     = bar;
         bars[barCount].CurrentSize  = curSizeIdx;
         bars[barCount].NewSize      = 0;
         bars[barCount].NewSizeBytes = curSizeBytes;
-        bars[barCount].OldAddr      = ReadBar64Addr(bus, dev, func, bar);
+        bars[barCount].OldAddr      = oldAddr;
         bars[barCount].NewAddr      = 0;
         bars[barCount].Relocated    = FALSE;
+        bars[barCount].HasRebar     = hasRebar;
 
-        if (rpos < 0) {
-            /* No ReBAR entry — keep as-is */
+        if (!hasRebar) {
+            /*
+             * v8 fix: BAR without ReBAR capability.  If the address is
+             * unassigned (0), we must allocate a new address for it —
+             * otherwise the bridge window calculation will include
+             * address 0 and claim memory starting from physical zero.
+             */
+            if (oldAddr == 0) {
+                bars[barCount].Relocated = TRUE;
+                anyWork = TRUE;
+                SizeStr(curSizeIdx, sizeBuf, sizeof(sizeBuf));
+                DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d %a unassigned — will allocate\n",
+                       bar, sizeBuf));
+            } else {
+                DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d %a at 0x%lx — no resize, keep\n",
+                       bar, sizeBuf, oldAddr));
+            }
+
             barCount++;
-            bar++;
+            bar++;  /* 64-bit BAR consumes two indices */
             continue;
         }
+
+        /* --- BAR has ReBAR capability: decide resize strategy --- */
 
         UINT32 sizes = RebarGetSizes(bus, dev, func, epos, vid, did, bar);
 
@@ -925,28 +1049,51 @@ static VOID SetupDevice(UINT8 bus, UINT8 dev, UINT8 func,
                     break;
                 }
             }
+
+            /*
+             * v8 fix: even if no resize is needed, if OldAddr is 0 we
+             * still need to allocate an address.
+             */
+            if (!bars[barCount].Relocated && oldAddr == 0) {
+                bars[barCount].Relocated = TRUE;
+                anyWork = TRUE;
+                SizeStr(curSizeIdx, sizeBuf, sizeof(sizeBuf));
+                DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d %a unassigned — will allocate\n",
+                       bar, sizeBuf));
+            }
         } else {
             /* ---- SMALL BAR: try in-place growth ---- */
             SizeStr(curSizeIdx, sizeBuf, sizeof(sizeBuf));
             DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d %a — checking in-place growth\n",
                    bar, sizeBuf));
 
-            UINT8 inPlaceSize = FindMaxInPlaceSize(
-                bars[barCount].OldAddr, sizes, curSizeIdx,
-                bus, dev, func, bar);
-
-            if (inPlaceSize > 0) {
-                bars[barCount].NewSize      = inPlaceSize;
-                bars[barCount].NewSizeBytes = 1ULL << (inPlaceSize + 20);
-                bars[barCount].Relocated    = FALSE;
+            if (oldAddr == 0) {
+                /*
+                 * v8 fix: can't grow in-place at address 0.
+                 * Allocate a new address instead.
+                 */
+                bars[barCount].Relocated = TRUE;
                 anyWork = TRUE;
-
-                SizeStr(inPlaceSize, sizeBuf2, sizeof(sizeBuf2));
-                DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d %a -> %a (in-place)\n",
-                       bar, sizeBuf, sizeBuf2));
+                DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d unassigned — will allocate (can't grow in-place at 0)\n",
+                       bar));
             } else {
-                DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d %a — no safe growth found\n",
-                       bar, sizeBuf));
+                UINT8 inPlaceSize = FindMaxInPlaceSize(
+                    oldAddr, sizes, curSizeIdx,
+                    bus, dev, func, bar);
+
+                if (inPlaceSize > 0) {
+                    bars[barCount].NewSize      = inPlaceSize;
+                    bars[barCount].NewSizeBytes = 1ULL << (inPlaceSize + 20);
+                    bars[barCount].Relocated    = FALSE;
+                    anyWork = TRUE;
+
+                    SizeStr(inPlaceSize, sizeBuf2, sizeof(sizeBuf2));
+                    DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d %a -> %a (in-place)\n",
+                           bar, sizeBuf, sizeBuf2));
+                } else {
+                    DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d %a — no safe growth found\n",
+                           bar, sizeBuf));
+                }
             }
         }
 
@@ -977,25 +1124,62 @@ static VOID SetupDevice(UINT8 bus, UINT8 dev, UINT8 func,
     }
 
     /* -------------------------------------------------------------- */
-    /* Phase 3: Disable memory decode                                  */
+    /* Phase 3: Disable memory decode + save all BAR registers         */
+    /*                                                                 */
+    /* v8 fix: save ALL BAR registers before any ReBAR CTRL writes.    */
+    /* AMD GPUs zero every BAR (including non-prefetchable MMIO, I/O,  */
+    /* and Expansion ROM) when any ReBAR CTRL register is written.     */
     /* -------------------------------------------------------------- */
 
     UINT16 origCmd = EcamRead16(bus, dev, func, PCI_CMD_REG);
-    EcamWrite16(bus, dev, func, PCI_CMD_REG, origCmd & ~PCI_CMD_MEMORY_SPACE);
+    EcamWrite16(bus, dev, func, PCI_CMD_REG,
+                origCmd & ~(PCI_CMD_MEMORY_SPACE | PCI_CMD_IO_SPACE));
     DEBUG((DEBUG_INFO, "ReBarDXE:   decode disabled (cmd 0x%04x -> 0x%04x)\n",
-           origCmd, origCmd & ~PCI_CMD_MEMORY_SPACE));
+           origCmd, origCmd & ~(PCI_CMD_MEMORY_SPACE | PCI_CMD_IO_SPACE)));
+
+    SAVED_BAR_REGS savedBars;
+    SaveDeviceBars(bus, dev, func, &savedBars);
 
     /* -------------------------------------------------------------- */
     /* Phase 4: Write new ReBAR sizes                                  */
+    /*                                                                 */
+    /* WARNING: on AMD GPUs, each ReBAR CTRL write zeros ALL BARs.     */
+    /* The saved state from Phase 3 will be restored in Phase 4b.      */
     /* -------------------------------------------------------------- */
 
+    BOOLEAN anyRebarWritten = FALSE;
+
     for (UINTN i = 0; i < barCount; i++) {
-        if (bars[i].NewSize > 0) {
+        if (bars[i].NewSize > 0 && bars[i].HasRebar) {
             SizeStr(bars[i].NewSize, sizeBuf, sizeof(sizeBuf));
             DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d ReBAR CTRL <- %d (%a)\n",
                    bars[i].BarIndex, bars[i].NewSize, sizeBuf));
             RebarSetSize(bus, dev, func, epos, bars[i].BarIndex, bars[i].NewSize);
+            anyRebarWritten = TRUE;
         }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Phase 4b: Restore all BAR registers from saved state            */
+    /*                                                                 */
+    /* v8 fix: immediately restore every BAR to its pre-resize value.  */
+    /* This recovers non-prefetchable BARs (register apertures, I/O    */
+    /* ports) and the Expansion ROM BAR that were collateral damage.   */
+    /* Phase 5 will then overwrite only the BARs being relocated with  */
+    /* their new addresses.                                            */
+    /* -------------------------------------------------------------- */
+
+    if (anyRebarWritten) {
+        RestoreDeviceBars(bus, dev, func, &savedBars);
+
+        /* Verify the restore worked for non-pref BARs */
+        DEBUG((DEBUG_INFO, "ReBarDXE:   post-restore BARs:"));
+        for (UINT8 r = 0; r < NUM_BAR_REGS; r++) {
+            UINT32 v = EcamRead32(bus, dev, func, 0x10 + r * 4);
+            DEBUG((DEBUG_INFO, " [%d]=%08x", r, v));
+        }
+        UINT32 rom = EcamRead32(bus, dev, func, PCI_ROM_BAR_OFFSET);
+        DEBUG((DEBUG_INFO, " ROM=%08x\n", rom));
     }
 
     /* -------------------------------------------------------------- */
@@ -1027,6 +1211,7 @@ static VOID SetupDevice(UINT8 bus, UINT8 dev, UINT8 func,
             if (addr == 0) {
                 DEBUG((DEBUG_ERROR, "ReBarDXE:   MMIO alloc failed for BAR%d!\n",
                        bars[i].BarIndex));
+                /* Restore original command register and bail */
                 EcamWrite16(bus, dev, func, PCI_CMD_REG, origCmd);
                 return;
             }
@@ -1034,7 +1219,11 @@ static VOID SetupDevice(UINT8 bus, UINT8 dev, UINT8 func,
             bars[i].NewAddr = addr;
             WriteBar64Addr(bus, dev, func, bars[i].BarIndex, addr);
 
-            SizeStr(bars[i].NewSize, sizeBuf, sizeof(sizeBuf));
+            if (bars[i].NewSize > 0) {
+                SizeStr(bars[i].NewSize, sizeBuf, sizeof(sizeBuf));
+            } else {
+                SizeStr(bars[i].CurrentSize, sizeBuf, sizeof(sizeBuf));
+            }
             DEBUG((DEBUG_INFO, "ReBarDXE:   BAR%d relocated 0x%lx -> 0x%lx (%a)\n",
                    bars[i].BarIndex, bars[i].OldAddr, addr, sizeBuf));
         } else {
@@ -1050,15 +1239,73 @@ static VOID SetupDevice(UINT8 bus, UINT8 dev, UINT8 func,
             }
         }
 
-        /* Accumulate bridge window bounds */
+        /*
+         * v8 fix: only include BARs with valid addresses and nonzero
+         * sizes in the bridge window calculation.  A BAR at address 0
+         * with size 0 would produce windowBase=0, windowLimit=MAX_UINT64
+         * via underflow, claiming the entire address space.
+         */
+        if (bars[i].NewAddr == 0 || bars[i].NewSizeBytes == 0) {
+            DEBUG((DEBUG_WARN, "ReBarDXE:   BAR%d addr=0x%lx size=0x%lx — "
+                   "excluded from bridge window\n",
+                   bars[i].BarIndex, bars[i].NewAddr, bars[i].NewSizeBytes));
+            continue;
+        }
+
         if (bars[i].NewAddr < windowBase)
             windowBase = bars[i].NewAddr;
         if (bars[i].NewAddr + bars[i].NewSizeBytes - 1 > windowLimit)
             windowLimit = bars[i].NewAddr + bars[i].NewSizeBytes - 1;
     }
 
-    DEBUG((DEBUG_INFO, "ReBarDXE:   pref window needed: 0x%lx - 0x%lx\n",
-           windowBase, windowLimit));
+    /* -------------------------------------------------------------- */
+    /* Bridge window sanity check                                      */
+    /*                                                                 */
+    /* v8 fix: reject bridge windows that are clearly insane.  This    */
+    /* is a safety net — if the logic above is correct these checks    */
+    /* should never fire, but a bad bridge window kills the system.    */
+    /* -------------------------------------------------------------- */
+
+    if (windowBase == MAX_UINT64 || windowBase == 0 ||
+        windowLimit == 0 || windowLimit < windowBase) {
+        DEBUG((DEBUG_ERROR, "ReBarDXE:   ABORT: insane bridge window "
+               "0x%lx - 0x%lx, restoring original state\n",
+               windowBase, windowLimit));
+
+        /* Restore all BARs to their pre-resize state */
+        RestoreDeviceBars(bus, dev, func, &savedBars);
+
+        /* Restore any ReBAR CTRL registers to original sizes */
+        for (UINTN i = 0; i < barCount; i++) {
+            if (bars[i].NewSize > 0 && bars[i].HasRebar) {
+                RebarSetSize(bus, dev, func, epos,
+                             bars[i].BarIndex, bars[i].CurrentSize);
+            }
+        }
+        RestoreDeviceBars(bus, dev, func, &savedBars);
+        EcamWrite16(bus, dev, func, PCI_CMD_REG, origCmd);
+        return;
+    }
+
+    UINT64 windowSize = windowLimit - windowBase + 1;
+    if (windowSize > (32ULL << 30)) {   /* 32 GB — generous sanity limit */
+        DEBUG((DEBUG_ERROR, "ReBarDXE:   ABORT: bridge window too large "
+               "(0x%lx bytes, 0x%lx - 0x%lx)\n",
+               windowSize, windowBase, windowLimit));
+        RestoreDeviceBars(bus, dev, func, &savedBars);
+        for (UINTN i = 0; i < barCount; i++) {
+            if (bars[i].NewSize > 0 && bars[i].HasRebar) {
+                RebarSetSize(bus, dev, func, epos,
+                             bars[i].BarIndex, bars[i].CurrentSize);
+            }
+        }
+        RestoreDeviceBars(bus, dev, func, &savedBars);
+        EcamWrite16(bus, dev, func, PCI_CMD_REG, origCmd);
+        return;
+    }
+
+    DEBUG((DEBUG_INFO, "ReBarDXE:   pref window needed: 0x%lx - 0x%lx (0x%lx bytes)\n",
+           windowBase, windowLimit, windowSize));
 
     /* -------------------------------------------------------------- */
     /* Phase 6: Update bridge chain prefetchable windows               */
@@ -1270,7 +1517,7 @@ EFI_STATUS EFIAPI rebarInit(
     SizeStr(reBarState, sizeBuf, sizeof(sizeBuf));
 
     DEBUG((DEBUG_INFO, "==================================================\n"));
-    DEBUG((DEBUG_INFO, "ReBarDXE: Driver loaded, version 7-evict\n"));
+    DEBUG((DEBUG_INFO, "ReBarDXE: Driver loaded, version 8\n"));
     DEBUG((DEBUG_INFO, "ReBarDXE: max BAR size = %a (reBarState=%d)\n",
            sizeBuf, reBarState));
     DEBUG((DEBUG_INFO, "ReBarDXE: MMIO alloc range: 0x%lx - 0x%lx\n",
